@@ -7,16 +7,36 @@ const TARGET_SR = 16000;
 // OVERLAP_SECONDS of audio it has already transcribed plus NEW_AUDIO_SECONDS
 // of fresh audio. The overlap gives Whisper real context for words that
 // start right at the window boundary (a hard cut mid-word/mid-sentence is a
-// major accuracy killer for chunked streaming), and re-transcribed
-// overlapping words get deduplicated against what's already on screen. This
-// also means an update lands every NEW_AUDIO_SECONDS instead of waiting for
-// a much longer chunk to fill.
-const NEW_AUDIO_SECONDS = 2;
-const OVERLAP_SECONDS = 1;
+// major accuracy killer for chunked streaming). Which words from the
+// re-transcribed overlap are actually new is decided by word timestamp, not
+// by comparing text — see enqueueWordsByTimestamp for why.
+//
+// WINDOW length (NEW+OVERLAP) is what accuracy depends on. Whisper's encoder
+// always pads/trims to a fixed 30s internally, so a 3s window costs the same
+// encoder pass as a 1s one — there's no compute penalty to keeping this
+// generous. Below ~2.5s of real context, especially for singing, Whisper
+// starts guessing. NEW_AUDIO_SECONDS (the hop) is what latency depends on:
+// how much new audio has to arrive before the next inference fires.
+// Shrinking it costs more total compute (same-cost encoder pass, run more
+// often) but, now that "what's new" is timestamp-based instead of
+// text-matched, no longer costs accuracy — so it can be pushed fairly low.
+const NEW_AUDIO_SECONDS = 1;
+const OVERLAP_SECONDS = 2;
 const WINDOW_SAMPLES = TARGET_SR * (NEW_AUDIO_SECONDS + OVERLAP_SECONDS);
 const NEW_AUDIO_SAMPLES = TARGET_SR * NEW_AUDIO_SECONDS;
 const OVERLAP_SAMPLES = TARGET_SR * OVERLAP_SECONDS;
 const SILENCE_RMS_THRESHOLD = 0.006;
+// A word timestamped right at the trailing edge of a window is the least
+// reliable one in the whole window — Whisper aligned it without having seen
+// any audio after it yet. Its estimated position can shift once the next
+// window gives the model more context. Rather than commit to that position
+// immediately (which is what produced both dropped and duplicated words —
+// the same word landing on different sides of the cutoff in two consecutive
+// windows' independent estimates), hold back anything in the last
+// COMMIT_SAFETY_MARGIN_SECONDS of a window and let the next window, which
+// has that same audio sitting comfortably in its middle instead of its
+// edge, settle it.
+const COMMIT_SAFETY_MARGIN_SECONDS = 0.5;
 const TRANSFORMERS_CDN_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0";
 const MAX_WORDS = 3000;
 
@@ -46,9 +66,17 @@ export function useLiveTranscription() {
   const chunkQueueRef = useRef([]);
   const processingChunkRef = useRef(false);
 
-  // Last few words actually displayed, used to detect how much of a new
-  // window's transcript duplicates what the overlap region already showed.
-  const recentWordsRef = useRef([]);
+  // Absolute audio-time cursor: words at or before this point have already
+  // been shown, so a word only counts as new if its (absolute) start time is
+  // past it. windowStartTimeRef is where the *current* window's audio
+  // begins in that same absolute timeline. Both are tracked from actual
+  // accumulated sample counts rather than window-index * NEW_AUDIO_SECONDS —
+  // the audio processor delivers fixed 4096-sample callbacks that don't
+  // divide WINDOW_SAMPLES evenly, so each window is a slightly different
+  // actual length, and a fixed-hop assumption would drift from real time
+  // over a long session.
+  const committedUntilRef = useRef(-Infinity);
+  const windowStartTimeRef = useRef(0);
   const wordIdRef = useRef(0);
 
   function setStatus(text, live) {
@@ -221,6 +249,15 @@ export function useLiveTranscription() {
   }
 
   async function handleChunk(float32) {
+    const windowStart = windowStartTimeRef.current;
+    const windowLenSeconds = float32.length / TARGET_SR;
+    // The audio buffer's position advances by this window's real length
+    // minus the overlap we retained for the next one, regardless of
+    // whether we end up running inference on it — so this has to update
+    // even when the silence check below skips transcription, or the next
+    // window's timestamps would be computed against a stale start point.
+    windowStartTimeRef.current = windowStart + (float32.length - OVERLAP_SAMPLES) / TARGET_SR;
+
     // Judge silence on just the newly captured tail, not the retained
     // overlap context, so trailing silence after speech doesn't suppress
     // a window that's mostly old (already-processed) signal.
@@ -228,43 +265,31 @@ export function useLiveTranscription() {
     if (rms(newPortion) < SILENCE_RMS_THRESHOLD) return;
 
     try {
-      // No return_timestamps here — word-level timing needs cross-attention
-      // DTW alignment (real extra GPU/CPU work), and chunk-level timing
-      // isn't used either since overlap dedup works on the text itself.
-      // Skipping it is the single biggest per-window speed win available.
-      const output = await asrPipelineRef.current(float32);
+      // return_timestamps: "word" costs real extra GPU/CPU work (cross-
+      // attention DTW alignment), but it's what makes enqueueWordsByTimestamp
+      // possible below — see that function for why text-based dedup isn't
+      // good enough on its own.
+      //
+      // max_new_tokens is capped tight since a window never has more than a
+      // handful of words — this bounds decode time and cuts off Whisper's
+      // classic failure mode on instrumental/noisy segments where it gets
+      // stuck regenerating the same phrase up to the model's default
+      // length. (no_repeat_ngram_size was tried here too but caused visible
+      // word-choice corruption on legitimate speech — banning any repeated
+      // 3-gram is too blunt when normal speech genuinely repeats short
+      // phrases, so it forced the decoder into wrong tokens.)
+      const output = await asrPipelineRef.current(float32, {
+        max_new_tokens: 64,
+        return_timestamps: "word",
+      });
       // Inference is async — the user may have hit Stop while this window
       // was still transcribing. Drop stale results instead of rendering
       // words in after the session has ended.
       if (!runningRef.current) return;
-      enqueueWords(output.text);
+      enqueueWordsByTimestamp(output.chunks || [], windowStart, windowLenSeconds);
     } catch (err) {
       console.error("transcription error", err);
     }
-  }
-
-  function normalizeWord(w) {
-    return w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
-  }
-
-  // The overlap audio at the front of this window covers speech already
-  // shown from the previous window, so whisper will very likely transcribe
-  // it the same way again. Find the longest run where the tail of what's
-  // already on screen matches the head of the new transcript, and treat
-  // only what comes after that run as new.
-  function countOverlapWords(prevWords, newWords) {
-    const maxCheck = Math.min(12, prevWords.length, newWords.length);
-    for (let k = maxCheck; k > 0; k--) {
-      let match = true;
-      for (let i = 0; i < k; i++) {
-        if (normalizeWord(prevWords[prevWords.length - k + i]) !== normalizeWord(newWords[i])) {
-          match = false;
-          break;
-        }
-      }
-      if (match) return k;
-    }
-    return 0;
   }
 
   function pushWords(freshWords) {
@@ -274,27 +299,50 @@ export function useLiveTranscription() {
     });
   }
 
-  // Shared dedup step: figures out which words in a fresh transcript are
-  // actually new vs. already-displayed overlap, and returns just the new
-  // ones (or null if there's nothing new to show).
-  function dedupeIncoming(rawText) {
-    const text = (rawText || "").trim();
-    if (!text) return null;
+  // Every window after the first re-includes OVERLAP_SECONDS of audio
+  // already transcribed once. A first attempt at figuring out which words
+  // in the new transcript are actually new compared text against what was
+  // already shown — but Whisper doesn't reliably produce identical wording
+  // for the same audio when it lands in a different position in the context
+  // window each time ("tumor" vs "two more", dropped/inserted filler
+  // words), and lyrics in particular are dense with short common words
+  // ("you", "me", "the") that produce coincidental matches between
+  // unrelated parts of a song. No text-similarity heuristic survived real
+  // audio — they either let re-worded repeats back in or, worse, matched
+  // genuinely new words against unrelated old ones and silently ate them.
+  //
+  // Word timestamps sidestep the wording problem, but a naive "past
+  // OVERLAP_SECONDS" per-window cutoff introduced a new one: a word right at
+  // the boundary gets re-estimated independently by two consecutive
+  // windows, and those estimates can disagree enough to land it on the
+  // wrong side of the cutoff both times (dropped) or the right side both
+  // times (duplicated). Tracking one monotonic absolute-time cursor instead
+  // — and holding back anything in the current window's unreliable trailing
+  // margin (see COMMIT_SAFETY_MARGIN_SECONDS) rather than trusting a single
+  // window's estimate for it — makes each word committed exactly once, by
+  // construction, regardless of how its estimated position jitters between
+  // windows.
+  function enqueueWordsByTimestamp(chunks, windowStart, windowLenSeconds) {
+    const commitBeforeRel = windowLenSeconds - COMMIT_SAFETY_MARGIN_SECONDS;
+    const freshWords = [];
+    let newCommittedUntil = committedUntilRef.current;
 
-    const newWords = text.split(/\s+/).filter(Boolean);
-    if (!newWords.length) return null;
+    for (const c of chunks) {
+      if (!Array.isArray(c.timestamp)) continue;
+      const [relStart, relEnd] = c.timestamp;
+      if (relStart >= commitBeforeRel) break; // in the trailing margin — let the next window settle it
+      const absStart = windowStart + relStart;
+      if (absStart <= committedUntilRef.current) continue; // already shown
+      const text = (c.text || "").trim();
+      if (!text) continue;
+      freshWords.push(text);
+      const absEnd = windowStart + (typeof relEnd === "number" ? relEnd : relStart);
+      if (absEnd > newCommittedUntil) newCommittedUntil = absEnd;
+    }
 
-    const overlapCount = countOverlapWords(recentWordsRef.current, newWords);
-    const freshWords = newWords.slice(overlapCount);
-    if (!freshWords.length) return null;
+    if (!freshWords.length) return;
+    committedUntilRef.current = newCommittedUntil;
 
-    recentWordsRef.current = [...recentWordsRef.current, ...freshWords].slice(-20);
-    return freshWords;
-  }
-
-  function enqueueWords(rawText) {
-    const freshWords = dedupeIncoming(rawText);
-    if (!freshWords) return;
     // Inference is async — the user may have hit Stop while this window
     // was still transcribing. Drop stale results instead of rendering
     // words in after the session has ended.
@@ -347,7 +395,8 @@ export function useLiveTranscription() {
       pcmBufferRef.current = [];
       pcmBufferLenRef.current = 0;
       chunkQueueRef.current = [];
-      recentWordsRef.current = [];
+      committedUntilRef.current = -Infinity;
+      windowStartTimeRef.current = 0;
       setWords([]);
 
       processorNode.onaudioprocess = (e) => {
@@ -437,12 +486,12 @@ export function useLiveTranscription() {
 
   // Dev-only escape hatch so display modes can be exercised with canned
   // text when a real mic isn't available (e.g. automated/sandboxed
-  // browsers) — feeds the exact same batching path real transcription uses.
+  // browsers) — feeds the same word-push path real transcription uses.
   useEffect(() => {
     if (process.env.NODE_ENV === "production") return;
     window.__pushTestWords = (text) => {
-      const freshWords = dedupeIncoming(text);
-      if (freshWords) pushWords(freshWords);
+      const freshWords = (text || "").trim().split(/\s+/).filter(Boolean);
+      if (freshWords.length) pushWords(freshWords);
     };
     return () => {
       delete window.__pushTestWords;
