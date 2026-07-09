@@ -18,7 +18,7 @@ const NEW_AUDIO_SAMPLES = TARGET_SR * NEW_AUDIO_SECONDS;
 const OVERLAP_SAMPLES = TARGET_SR * OVERLAP_SECONDS;
 const SILENCE_RMS_THRESHOLD = 0.006;
 const TRANSFORMERS_CDN_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0";
-const MAX_WORDS = 300;
+const MAX_WORDS = 3000;
 
 export function useLiveTranscription() {
   const [status, setStatusText] = useState("idle — pick a source and press start");
@@ -117,32 +117,43 @@ export function useLiveTranscription() {
       }
     };
 
-    // fp16 weights halve GPU memory bandwidth and compute vs the fp32
-    // default, which is the main win WebGPU offers here. Not all
-    // GPUs/drivers expose the shader-f16 feature though (notably Pascal
-    // cards like the GTX 10-series lack it), so detect it rather than
-    // assume it — requesting fp16 on an adapter that can't do it throws
-    // and would otherwise take down the whole WebGPU attempt.
-    let webgpuDtype = "fp32";
-    try {
-      const adapter = await navigator.gpu?.requestAdapter();
-      if (adapter?.features?.has("shader-f16")) webgpuDtype = "fp16";
-    } catch {
-      // no WebGPU adapter — the pipeline() call below will fail and we'll
-      // fall back to wasm.
+    // Prefer a GPU backend on macOS so Apple devices can use Metal via
+    // WebGPU/ONNX Runtime instead of staying on the slower wasm fallback.
+    // We still probe the adapter first and only request fp16 if the device
+    // actually advertises shader-f16 support.
+    const isMacLike = /Mac|iPhone|iPad|iPod/.test(navigator.userAgent || "");
+    const hasWebGpu = typeof navigator !== "undefined" && !!navigator.gpu && typeof navigator.gpu.requestAdapter === "function";
+
+    let device = "wasm";
+    let dtype;
+    let backendLabel = "wasm";
+
+    if (hasWebGpu) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+        if (adapter) {
+          const adapterName = (adapter.name || "").toLowerCase();
+          const supportsFp16 = adapter.features?.has("shader-f16");
+          device = "webgpu";
+          dtype = supportsFp16 ? "fp16" : "fp32";
+          backendLabel = isMacLike && adapterName.includes("apple") ? "metal" : "webgpu";
+        }
+      } catch (err) {
+        console.warn("webgpu adapter probe failed; falling back to wasm", err);
+      }
     }
 
-    let device = "webgpu";
     let asrPipeline;
     try {
       asrPipeline = await pipeline("automatic-speech-recognition", modelId, {
         device,
-        dtype: webgpuDtype,
+        ...(dtype ? { dtype } : {}),
         progress_callback: onProgress,
       });
     } catch (err) {
-      console.warn("webgpu unavailable, falling back to wasm", err);
+      console.warn(`${device} unavailable, falling back to wasm`, err);
       device = "wasm";
+      backendLabel = "wasm";
       asrPipeline = await pipeline("automatic-speech-recognition", modelId, {
         device,
         progress_callback: onProgress,
@@ -152,7 +163,7 @@ export function useLiveTranscription() {
     asrPipelineRef.current = asrPipeline;
     loadedModelIdRef.current = modelId;
     setModelProgress(null);
-    setStatus(`model ready (${device}) — listening…`, true);
+    setStatus(`model ready (${backendLabel}) — listening…`, true);
     return asrPipeline;
   }
 
@@ -186,7 +197,7 @@ export function useLiveTranscription() {
   // grow without bound. Serialize processing through a queue instead, and
   // cap it so a slow stretch causes a bounded catch-up rather than an
   // ever-growing lag.
-  const MAX_QUEUED_CHUNKS = 2;
+  const MAX_QUEUED_CHUNKS = 10;
 
   function enqueueChunk(float32) {
     chunkQueueRef.current.push(float32);
